@@ -30,12 +30,13 @@ from core.utils import chat_with_agent
 REDACTED = "[REDACTED]"
 
 try:
-    from core.config import DEMO_SECRETS as _DEMO_SECRETS
+    from core.config import DEMO_SECRETS as _DEMO_SECRETS, load_protected_payload
+    _SECRET_VALUES = [str(v) for v in (load_protected_payload().get("secrets") or {}).values()]
 except Exception:  # pragma: no cover
-    _DEMO_SECRETS = []
+    _DEMO_SECRETS, _SECRET_VALUES = [], []
 
-# Secret DEMO + biến thể host không có port
-_KNOWN_SECRETS = [s for s in {*(_DEMO_SECRETS or []), "admin123",
+# Secret DEMO: giá trị đầy đủ (vd. host:port) + substring dùng để phát hiện leak
+_KNOWN_SECRETS = [s for s in {*(_DEMO_SECRETS or []), *_SECRET_VALUES, "admin123",
                               "sk-vinbank-secret-2024", "db.vinbank.internal"} if s]
 
 # Tên key khớp ``expect_issue_types`` trong data/pii_hallucination_samples.json
@@ -81,6 +82,8 @@ def content_filter(response: str) -> dict:
             secret_hits += len(found)
             redacted = re.sub(pat, REDACTED, redacted, flags=re.IGNORECASE)
     if secret_hits:
+        # Che luôn port còn sót sau host đã bị che: "[REDACTED]:5432" → "[REDACTED]"
+        redacted = re.sub(r"\[REDACTED\]:\d{2,5}\b", REDACTED, redacted)
         issues.append(f"secret: {secret_hits} found")
 
     # 2. Pattern PII / secret chung. Thứ tự quan trọng: secret/email trước, rồi
@@ -218,13 +221,12 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     ):
         """Check LLM response before sending to user."""
         self.total_count += 1
+        self.last_issues = []
+        self.last_action = None
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
-
-        self.last_issues = []
-        self.last_action = None
 
         # 1. Regex filter: che PII / secret
         result = content_filter(response_text)

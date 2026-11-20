@@ -94,6 +94,62 @@
 
 ---
 
-## ⏳ Checkpoint 3 — chưa làm (chờ lệnh)
+## ✅ Checkpoint 3 — Blue / ghép pipeline + sinh file phòng thủ
+
+**Chuẩn bị:** điền `.env` — `OPENROUTER_API_KEY` (Blue) + `RED_TEAM_PROVIDER=gemini`, `GOOGLE_API_KEY`, `GEMINI_MODEL=gemini-3.5-flash` (Red, dùng ở CP4).
+
+### `src/assignment/rate_limiter.py` — `RateLimitPlugin`
+- Sliding window theo từng `user_id` (deque timestamp): bỏ timestamp cũ hơn `now - window_seconds`.
+- Đủ `max_requests` (10) trong 60s → `blocked_count += 1`, trả `[rate_limiter] Rate limit exceeded … Try again in Ns` (không gọi LLM). Request bị chặn **không** được ghi timestamp (để không kéo dài thời gian khoá).
+- Còn quota → ghi timestamp, `return None`.
+
+### `src/assignment/audit_log.py` — `AuditLogPlugin`
+- `record_input`: lưu `request_id`, `user_id`, `timestamp`, `input` + thời điểm bắt đầu (`perf_counter`).
+- `record_output`: ghép với input theo `request_id`, thêm `output`, `blocked`, `layer`, `latency_ms`, `completed_at`, + `redacted` / `issues`.
+- `export_json`: tự `mkdir` rồi ghi JSON array ra `outputs/audit_log.json`.
+
+### `src/assignment/monitoring.py` — `MonitoringAlert`
+- Thêm `record(blocked, layer, redacted)` để cập nhật bộ đếm (tổng, bị chặn, rate-limit hits, chặn theo từng lớp, số response bị redact) và `record_judge()`.
+- `check_metrics()`: tạo `Alert` khi `block_rate > 50%`, `rate_limit_hits ≥ 5`, `judge_fail_rate > 30%`. Gọi lại nhiều lần không tạo alert trùng.
+- `export_json`: ghi snapshot + `blocked_by_layer` + `thresholds` ra `outputs/metrics.json`.
+
+### `src/assignment/pipeline.py`
+- **`is_egress_allowed(destination, payload)`** — rule code, không hỏi LLM:
+  - URL phải là `https`, host **khớp chính xác** allowlist `api.vinbank.example` / `cases.vinbank.example` (chặn `api.vinbank.example.evil.com`), không có `user@`, port chỉ 443.
+  - Payload (đã normalize Unicode/bỏ dấu) không được chứa: secret DEMO (kể cả bị chèn dấu cách: `db . vinbank . internal`), `password`/`mật khẩu`, `api key`/`sk-…`, host `.internal`, email, SĐT VN.
+- **`build_production_plugins()`** → `[RateLimitPlugin, InputGuardrailPlugin, OutputGuardrailPlugin]` (rẻ nhất chạy trước).
+- **`build_observability()`** → `(AuditLogPlugin(), MonitoringAlert())`. Audit/monitoring là **side observer**, không chặn, ghi mọi request kể cả request bị chặn sớm.
+- **`BluePipeline`** (class mới): tự gọi từng plugin theo thứ tự để biết chính xác **lớp nào chặn**, truyền `user_id` thật cho rate limiter (OpenAIRunner gốc luôn dùng chung `user_id="student"`). LLM gọi qua `create_blue_agent(plugins=[])` (OpenRouter Liquid, model khoá cứng — không đổi). Có retry + backoff 5s/10s/20s cho lỗi `RateLimitError`/`InternalServerError` của free tier.
+  - Quy ước `blocked`: chặn ở rate limiter/input, **hoặc** output guardrail phát hiện secret (secret/api_key/password/internal_host). PII thường (SĐT/email) chỉ bị redact → `blocked: false`, `redacted: true`.
+- **`run_assignment_suite()`** — mỗi nhóm một `user_id` riêng:
+  - Test 1: 6 câu banking an toàn (có 1 câu tiếng Việt).
+  - Test 2: 9 câu tấn công (ignore instructions, DAN, system prompt, indirect injection zero-width trong email, pretend admin, tiếng Việt, token `<|system|>`, chữ tách `i-g-n-o-r-e`, hack/steal).
+  - Test 3: spam 15 request cùng user (bỏ qua gọi LLM cho request lọt để tiết kiệm quota free — chỉ đo rate limiter).
+  - Test 4: 7 case biên (rỗng, khoảng trắng, emoji, input 3000 ký tự, SQL-injection-like, full-width injection, câu thời tiết lạc đề).
+  - Thêm field phụ (schema cho phép): `plugin_order`, `egress_checks` (7 case), `metrics`.
+  - Ghi `outputs/results.json`, `outputs/audit_log.json`, `outputs/metrics.json`.
+
+### Sửa thêm ở CP2 (phát hiện khi test CP3)
+- `OutputGuardrailPlugin`: reset `last_issues`/`last_action` **trước** nhánh return sớm (response rỗng) để không giữ trạng thái của request trước.
+- `content_filter`: lấy thêm giá trị đầy đủ trong `vinbank_secrets.json` (vd. `db.vinbank.internal:5432`) + che phần `:port` còn sót. Trước đó kết quả là `[REDACTED]:5432`.
+
+### Kết quả (`python src/main.py --part 3`)
+
+| Nhóm | Kết quả |
+|------|---------|
+| Safe queries | **0/6 bị chặn**, cả 6 đều có câu trả lời thật từ Liquid |
+| Attack queries | **9/9 bị chặn** (đều tại `input_guardrail`) |
+| Rate limit | sent 15 · passed 10 · **blocked 5** (từ request #11) |
+| Edge cases | 7 case: rỗng/khoảng trắng/emoji/full-width/lạc đề → BLOCK; câu dài + SQL-like (có từ banking) → PASS |
+| Egress | 1 ALLOW (endpoint VinBank + payload sạch), 6 DENY |
+| Metrics | 37 request, 19 bị chặn (input 14, rate 5), 2 alert: `block_rate` 51% và `rate_limit_hits` 5 |
+
+- `outputs/` có đủ 3 file: `results.json`, `audit_log.json` (37 entry, có latency), `metrics.json`.
+- `pytest tests/public -q` → **10 passed** (gồm egress + 4 test contract của `results.json`).
+- `pytest tests/smoke -q` → **39 passed**.
+- Test thêm bằng LLM giả: response chứa secret → output guardrail redact + `blocked: true`; response chứa SĐT → redact, `blocked: false`.
+- Lần chạy thật free tier trả `RateLimitError` / `InternalServerError` vài lần, retry xử lý được. Lần chạy đầu (chưa có backoff đủ dài) có 2 câu bị `llm_error` → đã sửa và chạy lại.
+
+> Ghi chú: Lần sửa `:port` của `content_filter` diễn ra sau lần chạy cuối, nhưng không request nào trong lần chạy đó đi tới bước redact nên `results.json` không bị ảnh hưởng. Có thể chạy lại `--part 3` nếu muốn file khớp 100% với code mới (tốn ~10 lượt gọi OpenRouter).
 ## ⏳ Checkpoint 4 — chưa làm (chờ lệnh)
 ## ⏳ Checkpoint 5 — chưa làm (chờ lệnh)
